@@ -7,11 +7,10 @@ on:
 
 jobs:
   build:
-    # Pinning to 22.04 avoids runner provisioning hiccups
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Code
+    - name: Checkout Source Code
       uses: actions/checkout@v4
 
     - name: Set up JDK 17
@@ -20,17 +19,22 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@v4
-      with:
-        cache-disabled: true # Disables the GitHub cache service causing the 400/500 errors
+    - name: Download & Run Gradle
+      run: |
+        echo "=== Installing Standalone Gradle ==="
+        wget -q https://services.gradle.org/distributions/gradle-8.6-bin.zip
+        unzip -q gradle-8.6-bin.zip
+        export PATH=$PWD/gradle-8.6/bin:$PATH
 
-    - name: Build Debug APK
-      run: gradle assembleDebug --no-daemon --stacktrace
+        echo "=== Verifying Gradle Version ==="
+        gradle --version
 
-    - name: Upload APK
+        echo "=== Building APK ==="
+        gradle assembleDebug --no-daemon --stacktrace
+
+    - name: Upload Finished APK
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: Nuvio-App-APK
+        name: Nuvio-Debug-APK
         path: app/build/outputs/apk/debug/app-debug.apk
