@@ -7,11 +7,11 @@
         android:allowBackup="true"
         android:hardwareAccelerated="true"
         android:label="Nuvio"
-        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
         android:usesCleartextTraffic="true">
 
         <activity
-            android:name=".MainActivity"
+            android:name="tv.nuvio.clone.MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -20,7 +20,7 @@
         </activity>
 
         <activity
-            android:name=".ui.PlayerActivity"
+            android:name="tv.nuvio.clone.ui.PlayerActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout"
             android:screenOrientation="sensorLandscape" />
     </application>
