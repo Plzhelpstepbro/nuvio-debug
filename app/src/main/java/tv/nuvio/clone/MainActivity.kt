@@ -38,6 +38,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.google.gson.Gson
+import com.google.gson.JsonParser
 import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
@@ -47,10 +48,10 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 // ==========================================
-// 1. DATA MODELS & STREMIO ADDON SPEC
+// 1. DATA MODELS & CATALOG
 // ==========================================
 data class MediaItem(
-    val id: String, // IMDB or TMDB ID (e.g. tt0111161 or 1)
+    val id: String, // IMDB ID (e.g. tt1087260)
     val title: String,
     val overview: String,
     val category: String, // "movie" or "series"
@@ -68,42 +69,30 @@ data class StreamSource(
     val addonName: String = "Built-in"
 )
 
-// Stremio-Standard Addon Manifest
 data class AddonManifest(
-    @SerializedName("id") val id: String,
-    @SerializedName("name") val name: String,
-    @SerializedName("version") val version: String,
-    @SerializedName("description") val description: String? = null,
-    @SerializedName("resources") val resources: List<String> = emptyList(), // e.g. ["catalog", "stream"]
-    @SerializedName("types") val types: List<String> = emptyList(),         // e.g. ["movie", "series"]
-    var transportUrl: String = ""                                            // Base URL (without /manifest.json)
-)
-
-data class StremioStreamResponse(
-    @SerializedName("streams") val streams: List<StremioStreamItem>? = emptyList()
-)
-
-data class StremioStreamItem(
-    @SerializedName("name") val name: String? = null,
-    @SerializedName("title") val title: String? = null,
-    @SerializedName("url") val url: String? = null
+    val id: String,
+    val name: String,
+    val version: String,
+    val description: String? = null,
+    val resources: List<String> = emptyList(),
+    val types: List<String> = emptyList(),
+    var transportUrl: String = ""
 )
 
 // ==========================================
-// 2. ADDON SYNC & PERSISTENCE REPOSITORY
+// 2. BULLETPROOF ADD-ON ENGINE
 // ==========================================
 object AddonManager {
     private const val PREFS_NAME = "nuvio_addons_prefs"
-    private const val KEY_ADDONS = "installed_manifests"
+    private const val KEY_ADDONS = "installed_manifests_v2"
 
-    // Default pre-installed Public Domain / Creative Commons streams addon
     private val DEFAULT_ADDONS = listOf(
         AddonManifest(
-            id = "tv.nuvio.publicstreams",
-            name = "Open Blender Streams",
-            version = "1.2.0",
-            description = "Provides official high-speed 4K & 1080p open streams for benchmark open-source media.",
-            resources = listOf("stream", "catalog"),
+            id = "tv.nuvio.cinemeta",
+            name = "Cinemeta Official",
+            version = "3.0.12",
+            description = "Provides official metadata, stream endpoints, and catalog info for movies and TV series.",
+            resources = listOf("catalog", "meta", "stream"),
             types = listOf("movie", "series"),
             transportUrl = "https://v3-cinemeta.strem.io"
         )
@@ -125,59 +114,115 @@ object AddonManager {
         prefs.edit().putString(KEY_ADDONS, Gson().toJson(addons)).apply()
     }
 
-    // Fetches and synchronizes a JSON manifest from any HTTP or stremio:// URL
-    suspend fun syncAddonFromUrl(rawUrl: String): AddonManifest = withContext(Dispatchers.IO) {
-        val cleanedUrl = rawUrl.trim().replace("stremio://", "https://")
-        val manifestUrl = if (cleanedUrl.endsWith("/manifest.json")) cleanedUrl else "$cleanedUrl/manifest.json"
+    // Helper: Follows HTTP redirects (301, 302, 307, 308) across protocols safely
+    private fun fetchHttpWithRedirects(initialUrl: String): String {
+        var currentUrl = initialUrl
+        var redirects = 0
+        while (redirects < 6) {
+            val conn = URL(currentUrl).openConnection() as HttpURLConnection
+            conn.instanceFollowRedirects = true
+            conn.connectTimeout = 9000
+            conn.readTimeout = 9000
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:125.0) Nuvio/1.0")
+            conn.setRequestProperty("Accept", "application/json, text/plain, */*")
 
-        val conn = URL(manifestUrl).openConnection() as HttpURLConnection
-        conn.connectTimeout = 8000
-        conn.readTimeout = 8000
-        conn.setRequestProperty("User-Agent", "Nuvio/1.0 (Android; StremioCompatible)")
+            val status = conn.responseCode
+            if (status in 300..399) {
+                val newUrl = conn.getHeaderField("Location") ?: break
+                currentUrl = if (newUrl.startsWith("http")) newUrl else URL(URL(currentUrl), newUrl).toString()
+                redirects++
+                continue
+            }
 
-        val json = conn.inputStream.bufferedReader().use { it.readText() }
-        val manifest = Gson().fromJson(json, AddonManifest::class.java)
-        manifest.transportUrl = manifestUrl.substringBeforeLast("/manifest.json")
-        manifest
+            if (status != 200) {
+                throw Exception("HTTP $status while contacting add-on host")
+            }
+
+            return conn.inputStream.bufferedReader().use { it.readText() }
+        }
+        throw Exception("Too many redirects from add-on server")
     }
 
-    // Queries all installed addons that support "stream" for a given movie/show ID
+    // Parses ANY Stremio manifest format (supports both string array and object array resources)
+    suspend fun syncAddonFromUrl(rawInput: String): AddonManifest = withContext(Dispatchers.IO) {
+        var clean = rawInput.trim().replace("stremio://", "https://")
+        if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
+            clean = "https://$clean"
+        }
+        val manifestUrl = if (clean.endsWith(".json")) clean else "${clean.removeSuffix("/")}/manifest.json"
+
+        val rawJson = fetchHttpWithRedirects(manifestUrl)
+        val root = JsonParser.parseString(rawJson).asJsonObject
+
+        val id = root.get("id")?.asString ?: "addon.${System.currentTimeMillis()}"
+        val name = root.get("name")?.asString ?: "Community Addon"
+        val version = root.get("version")?.asString ?: "1.0.0"
+        val description = root.get("description")?.asString
+
+        // Parse resources flexibly (handles ["stream"] AND [{"name":"stream"}])
+        val resourcesList = mutableListOf<String>()
+        root.getAsJsonArray("resources")?.forEach { elem ->
+            when {
+                elem.isJsonPrimitive -> resourcesList.add(elem.asString)
+                elem.isJsonObject -> {
+                    elem.asJsonObject.get("name")?.asString?.let { resourcesList.add(it) }
+                }
+            }
+        }
+
+        // Parse types flexibly
+        val typesList = mutableListOf<String>()
+        root.getAsJsonArray("types")?.forEach { elem ->
+            if (elem.isJsonPrimitive) typesList.add(elem.asString)
+        }
+
+        AddonManifest(
+            id = id,
+            name = name,
+            version = version,
+            description = description,
+            resources = if (resourcesList.isEmpty()) listOf("stream") else resourcesList,
+            types = typesList,
+            transportUrl = manifestUrl.substringBeforeLast("/manifest.json")
+        )
+    }
+
+    // Resolves streams dynamically across all installed stream addons
     suspend fun fetchStreamsFromAddons(context: Context, type: String, id: String): List<StreamSource> = withContext(Dispatchers.IO) {
         val addons = getInstalledAddons(context).filter { it.resources.contains("stream") }
-        val resolvedStreams = mutableListOf<StreamSource>()
+        val results = mutableListOf<StreamSource>()
 
         for (addon in addons) {
             try {
-                val streamEndpoint = "${addon.transportUrl}/stream/$type/$id.json"
-                val conn = URL(streamEndpoint).openConnection() as HttpURLConnection
-                conn.connectTimeout = 5000
-                conn.readTimeout = 5000
-                conn.setRequestProperty("User-Agent", "Nuvio/1.0 (Android; StremioCompatible)")
+                val streamUrl = "${addon.transportUrl}/stream/$type/$id.json"
+                val responseJson = fetchHttpWithRedirects(streamUrl)
+                val root = JsonParser.parseString(responseJson).asJsonObject
 
-                if (conn.responseCode == 200) {
-                    val responseJson = conn.inputStream.bufferedReader().use { it.readText() }
-                    val response = Gson().fromJson(responseJson, StremioStreamResponse::class.java)
-                    response.streams?.forEach { s ->
-                        val url = s.url ?: return@forEach
-                        val title = s.title ?: s.name ?: "Stream"
-                        val quality = when {
-                            title.contains("4K", true) || title.contains("2160", true) -> "4K"
-                            title.contains("1080", true) -> "1080p"
-                            title.contains("720", true) -> "720p"
-                            else -> "HD"
+                root.getAsJsonArray("streams")?.forEach { elem ->
+                    if (elem.isJsonObject) {
+                        val obj = elem.asJsonObject
+                        val url = obj.get("url")?.asString
+                        val title = obj.get("title")?.asString ?: obj.get("name")?.asString ?: "Stream Source"
+                        if (!url.isNullOrBlank()) {
+                            val quality = when {
+                                title.contains("4K", true) || title.contains("2160", true) -> "4K"
+                                title.contains("1080", true) -> "1080p"
+                                title.contains("720", true) -> "720p"
+                                else -> "HD"
+                            }
+                            results.add(StreamSource(title, quality, url, addon.name))
                         }
-                        resolvedStreams.add(StreamSource(title, quality, url, addon.name))
                     }
                 }
             } catch (_: Exception) {
-                // Skip offline or unreachable addons gracefully
+                // Gracefully ignore add-ons that don't host this specific title
             }
         }
-        resolvedStreams
+        results
     }
 }
 
-// Sample Catalog with IMDb IDs to demonstrate real addon stream resolution
+// Sample Catalog with IMDb IDs
 val SampleCatalog = listOf(
     MediaItem(
         id = "tt1087260",
@@ -189,7 +234,7 @@ val SampleCatalog = listOf(
         rating = 8.5,
         year = "2008",
         streams = listOf(
-            StreamSource("Default Direct HLS", "1080p", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8", "Local")
+            StreamSource("Default Direct HLS", "1080p", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8", "Local Benchmark")
         )
     ),
     MediaItem(
@@ -202,7 +247,7 @@ val SampleCatalog = listOf(
         rating = 7.8,
         year = "2012",
         streams = listOf(
-            StreamSource("Tears of Steel 4K MP4", "4K", "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4", "Local")
+            StreamSource("Tears of Steel 4K MP4", "4K", "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4", "Local Benchmark")
         )
     ),
     MediaItem(
@@ -215,7 +260,7 @@ val SampleCatalog = listOf(
         rating = 8.2,
         year = "2010",
         streams = listOf(
-            StreamSource("Sintel Open Direct", "1080p", "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4", "Local")
+            StreamSource("Sintel Open Direct", "1080p", "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4", "Local Benchmark")
         )
     )
 )
@@ -228,7 +273,7 @@ val TextPrimary = Color(0xFFF5F7FA)
 val TextMuted = Color(0xFF8E95A5)
 
 // ==========================================
-// 3. MAIN ACTIVITY
+// 3. MAIN ACTIVITY & NAV
 // ==========================================
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -313,7 +358,7 @@ fun AddonsSyncScreen() {
     var inputManifestUrl by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(false) }
 
-    fun refreshAddonList() {
+    fun refresh() {
         installedAddons = AddonManager.getInstalledAddons(context)
     }
 
@@ -323,10 +368,9 @@ fun AddonsSyncScreen() {
     ) {
         item {
             Text("Add-on Manifest Sync", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            Text("Sync third-party Stremio-format JSON manifests for direct streams and catalogs.", color = TextMuted, fontSize = 13.sp)
+            Text("Paste any Stremio add-on URL to sync its JSON manifest and stream sources.", color = TextMuted, fontSize = 13.sp)
         }
 
-        // Install Manifest URL Card
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -334,12 +378,12 @@ fun AddonsSyncScreen() {
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Install New Add-on", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("Add Manifest URL", fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
                         value = inputManifestUrl,
                         onValueChange = { inputManifestUrl = it },
-                        placeholder = { Text("https://example.com/manifest.json", color = TextMuted, fontSize = 13.sp) },
+                        placeholder = { Text("https://.../manifest.json", color = TextMuted, fontSize = 13.sp) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
@@ -360,11 +404,11 @@ fun AddonsSyncScreen() {
                                             val manifest = AddonManager.syncAddonFromUrl(inputManifestUrl)
                                             val updated = installedAddons.filter { it.id != manifest.id } + manifest
                                             AddonManager.saveAddons(context, updated)
-                                            refreshAddonList()
+                                            refresh()
                                             inputManifestUrl = ""
-                                            Toast.makeText(context, "Synced: ${manifest.name} v${manifest.version}", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(context, "Added: ${manifest.name} (v${manifest.version})", Toast.LENGTH_SHORT).show()
                                         } catch (e: Exception) {
-                                            Toast.makeText(context, "Failed to parse manifest: ${e.message}", Toast.LENGTH_LONG).show()
+                                            Toast.makeText(context, "Sync Error: ${e.message}", Toast.LENGTH_LONG).show()
                                         } finally {
                                             isLoading = false
                                         }
@@ -377,18 +421,16 @@ fun AddonsSyncScreen() {
                             Text(if (isLoading) "Syncing..." else "Sync Manifest", color = Color.Black, fontWeight = FontWeight.Bold)
                         }
 
-                        // Preset button for quick testing
                         OutlinedButton(
                             onClick = { inputManifestUrl = "https://v3-cinemeta.strem.io/manifest.json" }
                         ) {
-                            Text("Paste Test Addon", color = ElectricCyan)
+                            Text("Cinemeta", color = ElectricCyan)
                         }
                     }
                 }
             }
         }
 
-        // Installed Addons List
         item {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -397,7 +439,6 @@ fun AddonsSyncScreen() {
             ) {
                 Text("Installed Add-ons (${installedAddons.size})", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
 
-                // Sync All Button
                 TextButton(
                     onClick = {
                         isLoading = true
@@ -411,9 +452,9 @@ fun AddonsSyncScreen() {
                                 }
                             }
                             AddonManager.saveAddons(context, refreshed)
-                            refreshAddonList()
+                            refresh()
                             isLoading = false
-                            Toast.makeText(context, "All add-ons resynced!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "All add-ons refreshed!", Toast.LENGTH_SHORT).show()
                         }
                     }
                 ) {
@@ -434,7 +475,7 @@ fun AddonsSyncScreen() {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(addon.name, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                             Text("ID: ${addon.id} • v${addon.version}", color = TextMuted, fontSize = 11.sp)
                         }
@@ -442,7 +483,7 @@ fun AddonsSyncScreen() {
                             onClick = {
                                 val updated = installedAddons.filter { it.id != addon.id }
                                 AddonManager.saveAddons(context, updated)
-                                refreshAddonList()
+                                refresh()
                             }
                         ) {
                             Text("🗑️", fontSize = 16.sp)
@@ -477,16 +518,11 @@ fun AddonsSyncScreen() {
 // 5. SCREEN: DETAIL & DYNAMIC STREAM RESOLVER
 // ==========================================
 @Composable
-fun DetailScreen(
-    media: MediaItem,
-    onBack: () -> Unit,
-    onPlay: (StreamSource) -> Unit
-) {
+fun DetailScreen(media: MediaItem, onBack: () -> Unit, onPlay: (StreamSource) -> Unit) {
     val context = LocalContext.current
     var addonStreams by remember { mutableStateOf<List<StreamSource>>(emptyList()) }
     var isResolvingStreams by remember { mutableStateOf(true) }
 
-    // Query all installed Stremio add-ons for streams when this media item opens
     LaunchedEffect(media.id) {
         isResolvingStreams = true
         val resolved = AddonManager.fetchStreamsFromAddons(context, media.category, media.id)
@@ -499,12 +535,7 @@ fun DetailScreen(
     LazyColumn(modifier = Modifier.fillMaxSize()) {
         item {
             Box(modifier = Modifier.fillMaxWidth().height(260.dp)) {
-                AsyncImage(
-                    model = media.backdropUrl,
-                    contentDescription = media.title,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
+                AsyncImage(model = media.backdropUrl, contentDescription = media.title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                 Box(
                     modifier = Modifier.fillMaxSize().background(
                         Brush.verticalGradient(listOf(Color.Black.copy(0.4f), ObsidianBg))
@@ -553,7 +584,7 @@ fun DetailScreen(
 
         if (allStreams.isEmpty() && !isResolvingStreams) {
             item {
-                Text("No active stream sources found. Sync a stream add-on in the Add-ons tab.", color = TextMuted, modifier = Modifier.padding(16.dp), fontSize = 13.sp)
+                Text("No streams found for this title. Sync a stream add-on in the Add-ons tab.", color = TextMuted, modifier = Modifier.padding(16.dp), fontSize = 13.sp)
             }
         } else {
             items(allStreams) { stream ->
