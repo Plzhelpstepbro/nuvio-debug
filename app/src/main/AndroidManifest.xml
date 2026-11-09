@@ -4,10 +4,11 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
+        android:name="tv.nuvio.clone.NuvioApp"
         android:allowBackup="true"
         android:hardwareAccelerated="true"
         android:label="Nuvio"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+        android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="true">
 
         <activity
@@ -18,6 +19,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name="tv.nuvio.clone.CrashActivity"
+            android:exported="false"
+            android:process=":crash_process" />
 
         <activity
             android:name="tv.nuvio.clone.ui.PlayerActivity"
