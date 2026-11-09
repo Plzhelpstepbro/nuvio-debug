@@ -26,7 +26,7 @@
             android:process=":crash_process" />
 
         <activity
-            android:name="tv.nuvio.clone.ui.PlayerActivity"
+            android:name="tv.nuvio.clone.PlayerActivity"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout"
             android:screenOrientation="sensorLandscape" />
     </application>
