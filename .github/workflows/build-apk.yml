@@ -7,7 +7,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinning to 22.04 avoids runner provisioning hiccups
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout Code
@@ -20,12 +21,15 @@ jobs:
         java-version: '17'
 
     - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@v3
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        cache-disabled: true # Disables the GitHub cache service causing the 400/500 errors
 
     - name: Build Debug APK
-      run: gradle assembleDebug --stacktrace
+      run: gradle assembleDebug --no-daemon --stacktrace
 
     - name: Upload APK
+      if: success()
       uses: actions/upload-artifact@v4
       with:
         name: Nuvio-App-APK
